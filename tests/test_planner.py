@@ -346,3 +346,221 @@ def test_spread_forbidden_break_diagnosis():
     assert exc.value.reason == "unsafe_boundary"
     assert exc.value.detail["boundary_index"] == 0
     assert exc.value.detail["forbidden_break"] is True
+
+
+# ---- 实体翻页恢复约束（boundary_times / min_turn_gap_seconds）----
+
+
+def test_recovery_gap_forces_merging_pages_single():
+    # 每页至多 2 个系统；边界 0、1 仅相差 2s < 5s，不能各放一个单系统页。
+    # 唯一 2 页方案 [0,1]|[2,3] 只在边界 1 翻页一次，恢复约束不限制第一次翻页。
+    res = plan_pages(
+        [5.0] * 4, [9.0, 9.0, 9.0], 10.0, 1.0,
+        boundary_times=[10.0, 12.0, 30.0], min_turn_gap_seconds=5.0,
+    )
+    assert [(p["start_system"], p["end_system"]) for p in res["pages"]] == [(0, 1), (2, 3)]
+    assert res["min_turn_rest"] == 9.0
+
+
+def test_recovery_gap_infeasible_single_reports_two_boundaries():
+    # 每页只能容纳一个系统 → 必须在边界 0、1 连续实体翻页，间隔 2s < 5s
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages(
+            [6.0] * 4, [9.0, 9.0, 9.0], 10.0, 1.0,
+            boundary_times=[10.0, 12.0, 30.0], min_turn_gap_seconds=5.0,
+        )
+    d = exc.value.detail
+    assert exc.value.reason == "turn_gap_unreachable"
+    assert d["boundary_index"] == 1
+    assert d["between_systems"] == [1, 2]
+    assert d["prev_turn_boundary_index"] == 0
+    assert d["prev_turn_between_systems"] == [0, 1]
+    assert d["turn_time_seconds"] == 12.0
+    assert d["prev_turn_time_seconds"] == 10.0
+    assert d["gap_seconds"] == 2.0
+    assert d["min_turn_gap_seconds"] == 5.0
+    assert d["physical_turn"] is True
+
+
+def test_recovery_first_physical_turn_not_gap_checked():
+    # 第一次实体翻页无论多早都允许；之后的翻页才检查间隔
+    res = plan_pages(
+        [6.0] * 3, [9.0, 9.0], 10.0, 1.0,
+        boundary_times=[0.1, 100.0], min_turn_gap_seconds=5.0,
+    )
+    assert res["page_count"] == 3
+    assert [p["physical_turn_after"] for p in res["pages"]] == [True, True, False]
+
+
+def test_recovery_gap_reports_best_achievable_previous_turn():
+    # 每页至多 2 个系统。位置 3（边界 2，22s）的两种页尾方案均不足：
+    # [1,2]|… 前次翻页在边界 0（10s），间隔 12s；[2]|… 前次翻页在边界 1（20s），
+    # 间隔 2s。取间隔最大（前次翻页最早）的边界 0 作为前次翻页诊断。
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages(
+            [4.0] * 5, [9.0, 9.0, 9.0, 9.0], 10.0, 1.0,
+            boundary_times=[10.0, 20.0, 22.0, 23.0], min_turn_gap_seconds=15.0,
+        )
+    d = exc.value.detail
+    assert exc.value.reason == "turn_gap_unreachable"
+    assert d["boundary_index"] == 2
+    assert d["prev_turn_boundary_index"] == 0
+    assert d["gap_seconds"] == 12.0
+
+
+def test_recovery_gap_forced_boundary_marks_forced():
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages(
+            [6.0] * 4, [9.0, 9.0, 9.0], 10.0, 1.0,
+            boundary_times=[10.0, 12.0, 30.0], min_turn_gap_seconds=5.0,
+            forced_break_after=[0, 1],
+        )
+    assert exc.value.reason == "turn_gap_unreachable"
+    assert exc.value.detail["boundary_index"] == 1
+    assert exc.value.detail["forced_break"] is True
+
+
+def test_recovery_rest_failure_precedes_gap_failure():
+    # 同一边界休止不足优先按 unsafe_boundary 报告
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages(
+            [6.0] * 3, [0.2, 9.0], 10.0, 1.0,
+            boundary_times=[10.0, 12.0], min_turn_gap_seconds=5.0,
+        )
+    assert exc.value.reason == "unsafe_boundary"
+    assert exc.value.detail["boundary_index"] == 0
+
+
+def test_recovery_gap_does_not_change_objective_order():
+    # 恢复约束可行时仍先最大化瓶颈休止：
+    # [0]|[1,2]|[3] 的实体翻页休止为 9、9（间隔 20s 达标）→ 瓶颈 9，
+    # 2 页方案 [0,1]|[2,3] 只翻一次、休止 3 → 瓶颈 3 被淘汰
+    res = plan_pages(
+        [4.0] * 4, [9.0, 3.0, 9.0], 10.0, 1.0,
+        boundary_times=[10.0, 20.0, 30.0], min_turn_gap_seconds=15.0,
+    )
+    assert res["min_turn_rest"] == 9.0
+    assert [(p["start_system"], p["end_system"]) for p in res["pages"]] == [
+        (0, 0), (1, 2), (3, 3),
+    ]
+
+
+def test_recovery_gap_tightens_bottleneck_when_better_plan_too_close():
+    # 无恢复约束时瓶颈 9（[0]|[1,2]|[3]）；两次实体翻页间隔仅 12s < 15s，
+    # 该方案被恢复约束裁掉，退到瓶颈 3 的 2 页方案
+    res = plan_pages(
+        [4.0] * 4, [9.0, 3.0, 9.0], 10.0, 1.0,
+        boundary_times=[10.0, 20.0, 22.0], min_turn_gap_seconds=15.0,
+    )
+    assert res["min_turn_rest"] == 3.0
+    assert [(p["start_system"], p["end_system"]) for p in res["pages"]] == [(0, 1), (2, 3)]
+
+
+def test_recovery_disabled_when_gap_zero_with_times():
+    # 提供 boundary_times 但 gap=0：恢复约束不启用，间隔再近也不裁剪
+    res = plan_pages(
+        [6.0, 6.0], [9.0], 10.0, 1.0,
+        boundary_times=[0.01], min_turn_gap_seconds=0.0,
+    )
+    assert res["page_count"] == 2
+
+
+def test_recovery_single_system_with_empty_times():
+    res = plan_pages(
+        [300.0], [], 1000.0, 2.0,
+        boundary_times=[], min_turn_gap_seconds=5.0,
+    )
+    assert res["page_count"] == 1
+
+
+def test_recovery_requires_times_when_gap_positive():
+    with pytest.raises(ValueError, match="boundary_times"):
+        plan_pages([5.0, 5.0], [9.0], 10.0, 1.0, min_turn_gap_seconds=1.0)
+
+
+def test_recovery_boundary_times_length_validated():
+    with pytest.raises(ValueError, match="boundary_times"):
+        plan_pages(
+            [5.0, 5.0, 5.0], [9.0, 9.0], 10.0, 1.0,
+            boundary_times=[1.0], min_turn_gap_seconds=1.0,
+        )
+
+
+def test_recovery_boundary_times_must_be_increasing():
+    with pytest.raises(ValueError, match="严格递增"):
+        plan_pages(
+            [5.0, 5.0, 5.0], [9.0, 9.0], 10.0, 1.0,
+            boundary_times=[2.0, 2.0], min_turn_gap_seconds=1.0,
+        )
+    with pytest.raises(ValueError, match="严格递增"):
+        plan_pages(
+            [5.0, 5.0, 5.0], [9.0, 9.0], 10.0, 1.0,
+            boundary_times=[3.0, 2.0], min_turn_gap_seconds=1.0,
+        )
+
+
+def test_recovery_spread_within_group_turn_not_counted():
+    # 每页一系统、start left：实体翻页在边界 1、3；组内边界 0、2 时间再近也不计入。
+    # 边界 0=0.5、边界 1=10（首次实体翻页，不检查）、边界 2=10.5（组内）、
+    # 边界 3=20（距边界 1 为 10s ≥ 5s）→ 可行
+    res = plan_pages(
+        [6.0] * 5, [9.0, 9.0, 9.0, 9.0], 10.0, 1.0,
+        layout_mode="spread",
+        boundary_times=[0.5, 10.0, 10.5, 20.0], min_turn_gap_seconds=5.0,
+    )
+    assert res["page_count"] == 5
+    assert [p["physical_turn_after"] for p in res["pages"]] == [
+        False, True, False, True, False,
+    ]
+
+
+def test_recovery_spread_gap_infeasible_between_right_pages():
+    # 实体翻页边界 1（10s）→ 边界 3（12s），间隔 2s < 5s；组内边界再近不影响结论
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages(
+            [6.0] * 5, [9.0, 9.0, 9.0, 9.0], 10.0, 1.0,
+            layout_mode="spread",
+            boundary_times=[0.5, 10.0, 10.5, 12.0], min_turn_gap_seconds=5.0,
+        )
+    d = exc.value.detail
+    assert exc.value.reason == "turn_gap_unreachable"
+    assert d["boundary_index"] == 3
+    assert d["prev_turn_boundary_index"] == 1
+    assert d["gap_seconds"] == 2.0
+
+
+def test_recovery_spread_start_right_counts_odd_page_turns():
+    # start right：实体翻页在边界 0、2；间隔 2s < 5s → 边界 2 不可达
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages(
+            [6.0] * 5, [9.0, 9.0, 9.0, 9.0], 10.0, 1.0,
+            layout_mode="spread", spread_start_side="right",
+            boundary_times=[10.0, 11.0, 12.0, 100.0], min_turn_gap_seconds=5.0,
+        )
+    d = exc.value.detail
+    assert exc.value.reason == "turn_gap_unreachable"
+    assert (d["boundary_index"], d["prev_turn_boundary_index"]) == (2, 0)
+    assert d["gap_seconds"] == 2.0
+
+
+def test_recovery_spread_bottleneck_optimization_preserved():
+    # 实体翻页在边界 0（休止 4）、2（休止 9），间隔达标 → 瓶颈 4
+    res = plan_pages(
+        [6.0] * 5, [4.0, 0.0, 9.0, 0.0], 10.0, 1.0,
+        layout_mode="spread", spread_start_side="right",
+        boundary_times=[10.0, 11.0, 20.0, 100.0], min_turn_gap_seconds=5.0,
+    )
+    assert res["min_turn_rest"] == 4.0
+    assert [p["physical_turn_after"] for p in res["pages"]] == [
+        True, False, True, False, False,
+    ]
+
+
+def test_recovery_spread_first_physical_turn_free():
+    # start left：首个实体翻页在边界 1（0.2s），不检查间隔；边界 3 距它 5.3s 达标
+    res = plan_pages(
+        [6.0] * 5, [9.0, 9.0, 9.0, 9.0], 10.0, 1.0,
+        layout_mode="spread",
+        boundary_times=[0.1, 0.2, 0.3, 5.5], min_turn_gap_seconds=5.0,
+    )
+    assert res["page_count"] == 5

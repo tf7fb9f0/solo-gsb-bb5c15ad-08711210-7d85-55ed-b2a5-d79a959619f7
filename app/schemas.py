@@ -34,6 +34,23 @@ class PlanRequest(BaseModel):
         default_factory=list,
         description="人工禁止分页点（系统下标数组，默认空）：对应系统之后不得分页",
     )
+    boundary_times: Optional[list[float]] = Field(
+        default=None,
+        description=(
+            "各相邻系统边界的演奏秒数（时间戳），长度 = 系统数 - 1，严格递增、"
+            "非负；与 min_turn_gap_seconds 配合启用实体翻页恢复约束"
+        ),
+    )
+    min_turn_gap_seconds: float = Field(
+        default=0.0,
+        ge=0,
+        allow_inf_nan=False,
+        description=(
+            "相邻两次实体翻页之间的最小恢复间隔秒数（默认 0，即不启用）；"
+            "> 0 时必须同时提供 boundary_times。single 每次翻页计入，"
+            "spread 仅右页后的实体翻页计入，组内换页不消耗恢复时间"
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_values(self) -> "PlanRequest":
@@ -46,6 +63,21 @@ class PlanRequest(BaseModel):
         if len(self.boundary_rests) != len(self.system_heights) - 1:
             raise ValueError(
                 "boundary_rests 的长度必须等于 len(system_heights) - 1"
+            )
+        if self.boundary_times is not None:
+            times = self.boundary_times
+            if len(times) != len(self.system_heights) - 1:
+                raise ValueError(
+                    "boundary_times 的长度必须等于 len(system_heights) - 1"
+                )
+            for t in times:
+                if t != t or t in (float("inf"), float("-inf")) or t < 0:
+                    raise ValueError("boundary_times 必须全部为非负的有限数值")
+            if any(times[k] <= times[k - 1] for k in range(1, len(times))):
+                raise ValueError("boundary_times 必须严格递增")
+        elif self.min_turn_gap_seconds > 0:
+            raise ValueError(
+                "启用实体翻页恢复约束（min_turn_gap_seconds > 0）时必须提供 boundary_times"
             )
         return self
 
@@ -96,6 +128,8 @@ class PlanOut(BaseModel):
     spread_start_side: Optional[str] = None
     forced_break_after: list[int] = Field(default_factory=list)
     forbidden_break_after: list[int] = Field(default_factory=list)
+    boundary_times: Optional[list[float]] = None
+    min_turn_gap_seconds: float = 0.0
     system_count: int
     page_count: int
     min_turn_rest: Optional[float] = None

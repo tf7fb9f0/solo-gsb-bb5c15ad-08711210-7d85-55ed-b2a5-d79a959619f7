@@ -277,3 +277,135 @@ def test_spread_forced_break_within_group_not_physical(client):
     assert plan["pages"][0]["physical_turn_after"] is False
     assert plan["pages"][0]["turn_rest_after"] is None
     assert plan["min_turn_rest"] is None
+
+
+# ---- 实体翻页恢复约束 ----
+
+RECOVERY_BODY = {
+    "system_heights": [5.0, 5.0, 5.0, 5.0],
+    "boundary_rests": [9.0, 9.0, 9.0],
+    "page_height": 10.0,
+    "min_safe_rest": 1.0,
+    "boundary_times": [10.0, 30.0, 60.0],
+    "min_turn_gap_seconds": 5.0,
+}
+
+
+def test_recovery_fields_default_for_old_requests(client):
+    r = client.post("/plans", json=GOOD_BODY)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert plan["boundary_times"] is None
+    assert plan["min_turn_gap_seconds"] == 0.0
+
+
+def test_recovery_plan_create_and_replay(client):
+    r = client.post("/plans", json=RECOVERY_BODY)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert plan["boundary_times"] == [10.0, 30.0, 60.0]
+    assert plan["min_turn_gap_seconds"] == 5.0
+    # 间隔均 >= 5s，每页两个系统（2 页，仅边界 1 一次实体翻页）或更细切分均可
+    for idx, p in enumerate(plan["pages"][:-1]):
+        assert p["physical_turn_after"] is True
+
+    # SQLite 回放保留恢复约束字段
+    got = client.get(f"/plans/{plan['id']}")
+    assert got.status_code == 200
+    assert got.json() == plan
+
+
+def test_recovery_gap_chosen_plan_respects_gap(client):
+    # 边界 0、1 仅相差 2s < 5s，不能连续单页翻 → 合并为 [0,1]|[2,3]
+    body = dict(RECOVERY_BODY, boundary_times=[10.0, 12.0, 30.0])
+    r = client.post("/plans", json=body)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert [(p["start_system"], p["end_system"]) for p in plan["pages"]] == [
+        (0, 1), (2, 3),
+    ]
+    assert plan["pages"][0]["turn_rest_after"] == 9.0
+
+
+def test_recovery_gap_infeasible_422_and_saves_nothing(client):
+    # 每页只能容纳一个系统 → 边界 0、1 必须连续实体翻页，间隔不足
+    body = dict(RECOVERY_BODY, page_height=5.5, boundary_times=[10.0, 12.0, 30.0])
+    r = client.post("/plans", json=body)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["error"] == "no_feasible_pagination"
+    assert detail["reason"] == "turn_gap_unreachable"
+    assert detail["boundary_index"] == 1
+    assert detail["between_systems"] == [1, 2]
+    assert detail["prev_turn_boundary_index"] == 0
+    assert detail["prev_turn_between_systems"] == [0, 1]
+    assert detail["turn_time_seconds"] == 12.0
+    assert detail["prev_turn_time_seconds"] == 10.0
+    assert detail["gap_seconds"] == 2.0
+    assert detail["min_turn_gap_seconds"] == 5.0
+    assert client.get("/plans").json() == []  # 不落库
+
+
+def test_recovery_spread_group_turn_not_gap_checked(client):
+    body = {
+        "system_heights": [6.0] * 5,
+        "boundary_rests": [9.0] * 4,
+        "page_height": 10.0,
+        "min_safe_rest": 1.0,
+        "layout_mode": "spread",
+        "boundary_times": [0.5, 10.0, 10.5, 20.0],
+        "min_turn_gap_seconds": 5.0,
+    }
+    r = client.post("/plans", json=body)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    # 组内边界 0、2 时间很近但不消耗恢复时间；实体翻页边界 1→3 间隔 10s 达标
+    assert [p["physical_turn_after"] for p in plan["pages"]] == [
+        False, True, False, True, False,
+    ]
+    got = client.get(f"/plans/{plan['id']}")
+    assert got.json() == plan
+
+
+def test_recovery_requires_times_422(client):
+    body = {
+        "system_heights": [5.0, 5.0],
+        "boundary_rests": [9.0],
+        "page_height": 10.0,
+        "min_safe_rest": 1.0,
+        "min_turn_gap_seconds": 3.0,
+    }
+    r = client.post("/plans", json=body)
+    assert r.status_code == 422
+    assert "boundary_times" in str(r.json()["detail"])
+    assert client.get("/plans").json() == []
+
+
+def test_recovery_bad_times_length_422(client):
+    r = client.post("/plans", json=dict(RECOVERY_BODY, boundary_times=[10.0, 20.0]))
+    assert r.status_code == 422
+    assert "boundary_times" in str(r.json()["detail"])
+    assert client.get("/plans").json() == []
+
+
+def test_recovery_times_must_be_strictly_increasing_422(client):
+    r = client.post("/plans", json=dict(RECOVERY_BODY, boundary_times=[10.0, 10.0, 30.0]))
+    assert r.status_code == 422
+    assert "严格递增" in str(r.json()["detail"])
+    assert client.get("/plans").json() == []
+
+
+def test_recovery_negative_gap_422(client):
+    r = client.post("/plans", json=dict(RECOVERY_BODY, min_turn_gap_seconds=-1.0))
+    assert r.status_code == 422
+    assert client.get("/plans").json() == []
+
+
+def test_recovery_times_without_gap_is_optional(client):
+    # 仅提供 boundary_times、gap 保持默认 0：合法，约束不启用
+    body = dict(GOOD_BODY, boundary_times=[8.0, 16.0, 24.0, 32.0])
+    r = client.post("/plans", json=body)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert plan["boundary_times"] == [8.0, 16.0, 24.0, 32.0]
+    assert plan["min_turn_gap_seconds"] == 0.0
