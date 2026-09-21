@@ -24,14 +24,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="乐谱安全翻页规划 API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "提交按顺序排列的谱面系统高度、边界休止秒数、页面可用高度与最低安全休止，"
         "动态规划生成完整分页方案：页面不超高、仅在达标边界翻页，"
         "依次最大化最短翻页休止、最小化各页留白平方和、减少页数。"
         "支持 single 单页模式与 spread 双页谱架模式（相邻左右页同组可见，"
         "组内边界不检查休止，仅翻过右页的实体翻页要求达标休止）。"
-        "可用 forced_break_after / forbidden_break_after 指定人工强制 / 禁止分页点。"
+        "可用 forced_break_after / forbidden_break_after 指定人工强制 / 禁止分页点；"
+        "提供 boundary_times 与 min_turn_gap_seconds 可启用实体翻页恢复约束："
+        "任意两次相邻实体翻页的演奏时间差不得小于该间隔（组内换页不消耗恢复时间）。"
     ),
     lifespan=lifespan,
 )
@@ -52,6 +54,9 @@ def _to_plan_out(record: dict) -> PlanOut:
         # 旧记录没有人工断点字段，按空数组回放
         forced_break_after=req.get("forced_break_after", []),
         forbidden_break_after=req.get("forbidden_break_after", []),
+        # 旧记录没有实体翻页恢复约束字段，按未启用回放
+        boundary_times=req.get("boundary_times"),
+        min_turn_gap_seconds=req.get("min_turn_gap_seconds", 0.0),
         system_count=len(req["system_heights"]),
         page_count=res["page_count"],
         min_turn_rest=res["min_turn_rest"],
@@ -78,6 +83,8 @@ def create_plan(req: PlanRequest) -> PlanOut:
             spread_start_side=req.spread_start_side,
             forced_break_after=req.forced_break_after,
             forbidden_break_after=req.forbidden_break_after,
+            boundary_times=req.boundary_times,
+            min_turn_gap_seconds=req.min_turn_gap_seconds,
         )
     except InfeasibleError as exc:
         raise HTTPException(

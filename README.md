@@ -12,6 +12,10 @@
     且只有实体翻页参与最短翻页休止最大化；
 - 支持人工断点约束：`forced_break_after` 指定的系统之后**必须分页**，
   `forbidden_break_after` 指定的系统之后**禁止分页**；
+- 支持实体翻页恢复约束：提供 `boundary_times`（各边界的演奏秒数，严格递增）与
+  `min_turn_gap_seconds`（默认 `0`，大于 0 即启用）后，任意两次**相邻实体翻页**
+  的演奏时间差必须不小于该值——single 模式每次翻页都计入，spread 模式仅右页
+  之后的翻页计入，组内（左页→右页）换页不消耗恢复时间；
 - 优化目标按字典序依次进行：
   1. **最大化**全曲最短的一次（实体）翻页休止（瓶颈值，越大越安全）；
   2. 在达到该瓶颈的方案中，**最小化各页留白高度的平方和**；
@@ -69,7 +73,11 @@ curl -X POST http://localhost:8000/plans \
 - `forced_break_after`：人工强制分页点（系统下标数组，默认 `[]`）——对应系统之后
   **必须**分页；
 - `forbidden_break_after`：人工禁止分页点（系统下标数组，默认 `[]`）——对应系统之后
-  **不得**分页。
+  **不得**分页；
+- `min_turn_gap_seconds`：实体翻页最小恢复间隔（秒，非负，默认 `0` 即不启用）；
+- `boundary_times`：各相邻系统边界的演奏秒数（长度 = 系统数 − 1，非负、严格
+  递增）。当 `min_turn_gap_seconds > 0` 时**必须**提供，否则返回 `422`；
+  `min_turn_gap_seconds = 0` 时可省略，也可以提供但不产生约束。
 
 两组断点约束的下标规则（违反时返回 `422` 并给出具体冲突）：
 
@@ -98,6 +106,8 @@ curl -X POST http://localhost:8000/plans \
 
 - `turn_rest_after`：该页之后（实体）翻页处的休止秒数；最后一页、以及 spread 组内
   （左页→右页）无需翻页的边界为 `null`；
+- `turn_time_after`：该页之后（实体）翻页处的演奏秒数（取自 `boundary_times`）；
+  未启用恢复约束、最后一页以及 spread 组内边界为 `null`；
 - `side`：spread 模式下为 `"left"` / `"right"`；single 模式不分左右页，为 `null`；
 - `physical_turn_after`：该页之后是否需要实体翻页。single 模式每次翻页都是实体翻页
   （最后一页除外）；spread 模式只有右页之后才是实体翻页。
@@ -192,6 +202,73 @@ curl -X POST http://localhost:8000/plans \
 }
 ```
 
+#### 实体翻页恢复约束示例
+
+```bash
+curl -X POST http://localhost:8000/plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "system_heights": [6, 6, 6, 6],
+    "boundary_rests": [9, 9, 9],
+    "boundary_times": [2, 8, 16],
+    "page_height": 10,
+    "min_safe_rest": 1.0,
+    "min_turn_gap_seconds": 5.0
+  }'
+```
+
+每系统一页时三次实体翻页分别发生在 2s、8s、16s，相邻间隔 6s、8s 均不少于 5s，
+方案可行；响应在每页给出实体翻页时刻 `turn_time_after`，并完整回放两个新字段：
+
+```json
+{
+  "layout_mode": "single",
+  "boundary_times": [2, 8, 16],
+  "min_turn_gap_seconds": 5.0,
+  "page_count": 4,
+  "min_turn_rest": 9.0,
+  "pages": [
+    {"page": 1, "start_system": 0, "end_system": 0, "turn_rest_after": 9.0, "turn_time_after": 2.0, "physical_turn_after": true, "...": "..."},
+    {"page": 2, "start_system": 1, "end_system": 1, "turn_rest_after": 9.0, "turn_time_after": 8.0, "physical_turn_after": true, "...": "..."},
+    {"page": 3, "start_system": 2, "end_system": 2, "turn_rest_after": 9.0, "turn_time_after": 16.0, "physical_turn_after": true, "...": "..."},
+    {"page": 4, "start_system": 3, "end_system": 3, "turn_rest_after": null, "turn_time_after": null, "physical_turn_after": false, "...": "..."}
+  ]
+}
+```
+
+spread 模式下只有右页之后的翻页计入恢复间隔，组内（左页→右页）换页即使发生在
+两次实体翻页之间也不消耗恢复时间。例如 5 个系统每页一系统、起始页在左侧时，
+实体翻页只落在边界 1、3，二者的时间差必须达标，边界 0、2 的时间不参与检查。
+
+若首个无法完成的（实体）翻页是因为与上一次实体翻页间隔不足，`reason` 为
+`recovery_gap_violation`，并同时给出**该边界**与**上一次实体翻页边界**
+（`422`，同样不保存任何部分方案）：
+
+```json
+{
+  "detail": {
+    "error": "no_feasible_pagination",
+    "reason": "recovery_gap_violation",
+    "boundary_index": 1,
+    "between_systems": [1, 2],
+    "previous_turn_boundary_index": 0,
+    "previous_turn_between_systems": [0, 1],
+    "previous_turn_time": 2.0,
+    "turn_time": 4.0,
+    "actual_gap_seconds": 2.0,
+    "min_turn_gap_seconds": 5.0,
+    "message": "边界 1（系统 1 与系统 2 之间）是首个因实体翻页恢复间隔不足而不可达的实体翻页边界：上一次实体翻页发生在边界 0（系统 0 与系统 1 之间，2.0s），两次翻页仅相隔 2.0s，小于要求的最小恢复间隔 5.0s"
+  }
+}
+```
+
+参数校验规则（违反返回 `422`）：
+
+- `min_turn_gap_seconds > 0` 但未提供 `boundary_times` → `422`；
+- `boundary_times` 长度不等于系统数 − 1、含负值/非数值 → `422`；
+- `boundary_times` 非严格递增 → `422`；
+- `min_turn_gap_seconds` 为负 → `422`。
+
 无解返回 `422`，指出首个问题区间，且**不保存任何部分方案**：
 
 ```json
@@ -215,7 +292,11 @@ curl -X POST http://localhost:8000/plans \
 - `unsafe_boundary`：首个无法安全断开的边界（附 `boundary_index` 与相邻系统下标）。
   spread 模式下该边界必为实体翻页边界（附 `physical_turn: true`）——若该页能落在左页，
   组内边界本无需检查休止。若该边界被 `forbidden_break_after` 禁止分页，
-  诊断附 `forbidden_break: true`；若该边界同时是强制分页点，附 `forced_break: true`。
+  诊断附 `forbidden_break: true`；若该边界同时是强制分页点，附 `forced_break: true`；
+- `recovery_gap_violation`：首个因实体翻页恢复间隔不可达的边界（启用恢复约束时）。
+  附本次翻页边界、`previous_turn_boundary_index`（上一次实体翻页边界）、两次翻页的
+  演奏时刻、`actual_gap_seconds` 与 `min_turn_gap_seconds`；spread 模式附
+  `physical_turn: true`。
 
 ### `GET /plans/{id}` — 查询完整方案
 
@@ -224,8 +305,10 @@ curl http://localhost:8000/plans/1
 ```
 
 不存在时返回 `404`。响应完整回放保存时的请求与结果，包括 `layout_mode`、
-`spread_start_side`、`forced_break_after`、`forbidden_break_after` 及逐页的
-`side`、`physical_turn_after`。
+`spread_start_side`、`forced_break_after`、`forbidden_break_after`、
+`boundary_times`、`min_turn_gap_seconds`，及逐页的 `side`、
+`physical_turn_after`、`turn_time_after`。**旧版本保存的记录缺少这些字段时，
+按默认值回放**（未启用恢复约束、无人工断点、single 模式）。
 
 ### `GET /plans` — 列出方案摘要
 
@@ -259,8 +342,14 @@ python3 -m pytest tests/ -q
 - 人工断点在两阶段 DP 的转移阶段统一生效：禁止断点直接跳过对应的分页边；
   强制断点通过预计算的"最早起始位置"裁剪所有跨过该断点的页面。强制分页不改变
   实体翻页判定——spread 组内（左页之后）的强制断点仍不检查休止、不参与瓶颈。
-- 无解诊断：先检查首个超高的系统；否则取首个不可达位置（spread 模式指两种页数奇偶
-  均不可达）——可证明此时其左侧边界要么被 `forbidden_break_after` 禁止分页，
+- 无解诊断：先检查首个超高的系统；否则取首个不可达位置（spread 模式指所有页数奇偶
+  状态均不可达）——可证明此时其左侧边界要么被 `forbidden_break_after` 禁止分页，
   要么是无法安全完成的（实体）翻页边界。
+- 实体翻页恢复约束在 DP 状态中额外携带**上一次实体翻页边界**：single 模式下该值
+  由页尾位置唯一确定（无额外状态维度）；spread 模式利用状态结构——"刚结束右页"
+  时上一次实体翻页即当前位置，"刚结束左页"时继承更早的右页翻页——对继承状态做
+  前缀聚合，两阶段整体仍为 O(n²)。组内（左页→右页）换页边不检查休止与恢复间隔，
+  首次实体翻页（此前无实体翻页）不受恢复间隔限制。无可行解时报告首个因间隔不可达
+  的边界，并在其所有可能的上一次实体翻页中取最早的一次作为取证前次翻页边界。
 - 存储使用 SQLite（`app/storage.py`），请求与结果以 JSON 整体保存，
   只有成功生成的完整方案才会入库；新增字段随 JSON 自动持久化并可回放。

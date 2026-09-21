@@ -34,6 +34,24 @@ class PlanRequest(BaseModel):
         default_factory=list,
         description="人工禁止分页点（系统下标数组，默认空）：对应系统之后不得分页",
     )
+    boundary_times: Optional[list[float]] = Field(
+        default=None,
+        description=(
+            "各相邻系统边界的演奏秒数（时间轴），长度 = 系统数 - 1，严格递增、非负。"
+            "启用实体翻页恢复约束（min_turn_gap_seconds > 0）时必须提供；"
+            "默认 null 表示不启用恢复约束"
+        ),
+    )
+    min_turn_gap_seconds: float = Field(
+        default=0.0,
+        ge=0,
+        allow_inf_nan=False,
+        description=(
+            "实体翻页最小恢复间隔（秒，默认 0 即不启用）。启用后任意两次相邻"
+            "实体翻页的演奏时间差必须不小于该值：single 每次翻页计入，"
+            "spread 仅右页之后的翻页计入，组内换页不消耗恢复时间"
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_values(self) -> "PlanRequest":
@@ -47,6 +65,21 @@ class PlanRequest(BaseModel):
             raise ValueError(
                 "boundary_rests 的长度必须等于 len(system_heights) - 1"
             )
+        if self.min_turn_gap_seconds > 0 and self.boundary_times is None:
+            raise ValueError(
+                "启用实体翻页恢复约束（min_turn_gap_seconds > 0）时必须提供 boundary_times"
+            )
+        if self.boundary_times is not None:
+            times = self.boundary_times
+            if len(times) != len(self.system_heights) - 1:
+                raise ValueError(
+                    "boundary_times 的长度必须等于 len(system_heights) - 1"
+                )
+            for t in times:
+                if t != t or t in (float("inf"), float("-inf")) or t < 0:
+                    raise ValueError("boundary_times 必须全部为非负的有限数值")
+            if any(times[k + 1] <= times[k] for k in range(len(times) - 1)):
+                raise ValueError("boundary_times 必须严格递增")
         return self
 
     @model_validator(mode="after")
@@ -81,6 +114,9 @@ class PageOut(BaseModel):
     used_height: float
     slack: float
     turn_rest_after: Optional[float] = None
+    # 实体翻页处的演奏秒数（来自 boundary_times）；未启用恢复约束、最后一页、
+    # spread 组内边界为 null
+    turn_time_after: Optional[float] = None
     side: Optional[str] = None  # spread 模式为 "left"/"right"；single 模式为 null
     physical_turn_after: Optional[bool] = None  # 该页之后是否需要实体翻页
 
@@ -96,6 +132,9 @@ class PlanOut(BaseModel):
     spread_start_side: Optional[str] = None
     forced_break_after: list[int] = Field(default_factory=list)
     forbidden_break_after: list[int] = Field(default_factory=list)
+    # 未启用恢复约束 / 旧记录回放时为 null 与 0.0
+    boundary_times: Optional[list[float]] = None
+    min_turn_gap_seconds: float = 0.0
     system_count: int
     page_count: int
     min_turn_rest: Optional[float] = None
