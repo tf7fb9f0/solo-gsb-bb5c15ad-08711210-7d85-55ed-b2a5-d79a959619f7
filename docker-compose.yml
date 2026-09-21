@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    image: score-pager-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/plans.db
+      PORT: 8000
+    volumes:
+      - plans-data:/data
+    restart: unless-stopped
+
+volumes:
+  plans-data:
